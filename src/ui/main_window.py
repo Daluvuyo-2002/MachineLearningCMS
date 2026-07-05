@@ -10,6 +10,7 @@ from .decision_tree_tab import DecisionTreeTab
 from .ai_insights_tab import AiInsightsTab
 from .styles import APP_STYLESHEET
 from ..database import Database
+from .settings_tab import SettingsTab
 
 
 class AppState:
@@ -52,6 +53,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.churn_tab, "Churn Prediction")
         self.tabs.addTab(self.dt_tab, "Decision Tree")
         self.tabs.addTab(self.ai_tab, "AI Insights")
+        
+        self.settings_tab = SettingsTab(self.app_state)
+        self.tabs.addTab(self.settings_tab, "Settings")
 
         # Sync tab data changes
         self.data_tab.data_loaded.connect(self.dashboard_tab.refresh)

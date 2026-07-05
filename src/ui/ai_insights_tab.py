@@ -1,20 +1,83 @@
-from datetime import datetime
+"""
+AI Insights Tab
+---------------
+Generates data-driven customer insights and recommended business actions.
+Integrates with the Google Gemini API (using Gemini 2.5 by default) if configured
+in Settings, with a high-fidelity local rule-based engine fallback.
+"""
 
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTextBrowser, QProgressBar, QMessageBox, QFrame
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 import pandas as pd
 import numpy as np
+import urllib.request
+import json
 
 from .styles import BLUE_ACCENT, WHITE, TEXT_DARK, BORDER_COLOR
+
+
+class GeminiWorker(QThread):
+    """Background worker to query the Gemini API to prevent main thread freezing."""
+    finished = pyqtSignal(str, bool)
+
+    def __init__(self, api_key: str, model_name: str, prompt: str):
+        super().__init__()
+        self.api_key = api_key
+        self.model_name = model_name
+        self.prompt = prompt
+
+    def run(self):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
+        headers = {"Content-Type": "application/json"}
+        data = {
+            "contents": [{
+                "parts": [{"text": self.prompt}]
+            }]
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers=headers,
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=35) as response:
+                res_body = response.read().decode("utf-8")
+                res_json = json.loads(res_body)
+                
+                candidates = res_json.get("candidates", [])
+                if candidates:
+                    content = candidates[0].get("content", {})
+                    parts = content.get("parts", [])
+                    if parts:
+                        text = parts[0].get("text", "")
+                        
+                        # Clean standard markdown blocks
+                        cleaned = text.strip()
+                        if cleaned.startswith("```html"):
+                            cleaned = cleaned[7:]
+                        elif cleaned.startswith("```"):
+                            cleaned = cleaned[3:]
+                        if cleaned.endswith("```"):
+                            cleaned = cleaned[:-3]
+                            
+                        self.finished.emit(cleaned.strip(), True)
+                        return
+                
+                self.finished.emit("Error: Could not extract text content from API response.", False)
+        except Exception as e:
+            self.finished.emit(str(e), False)
 
 
 class AiInsightsTab(QWidget):
     def __init__(self, app_state):
         super().__init__()
         self.app_state = app_state
+        self._worker = None
         self._build_ui()
 
     def _build_ui(self):
@@ -41,10 +104,6 @@ class AiInsightsTab(QWidget):
         controls_layout.addWidget(self.generate_btn)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Analyzing model results... %p%")
-        self.progress_bar.setTextVisible(True)
         self.progress_bar.setVisible(False)
         self.progress_bar.setFixedHeight(28)
         self.progress_bar.setStyleSheet(f"""
@@ -128,25 +187,270 @@ class AiInsightsTab(QWidget):
                                 "Please train the churn prediction model in the Churn Prediction tab first.")
             return
 
+        # Read config from QSettings
+        settings = QSettings("Daluvuyo", "CustomerInsightCMS")
+        api_key = settings.value("gemini_api_key", "").strip()
+        model_name = settings.value("gemini_model", "gemini-2.5-flash").strip()
+
         self.generate_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-
-        self.timer_counter = 0
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.advance_progress)
-        self.timer.start(80)
-
-    def advance_progress(self):
-        self.timer_counter += 8
-        self.progress_bar.setValue(min(self.timer_counter, 100))
-        if self.timer_counter >= 100:
-            self.timer.stop()
-            self.progress_bar.setVisible(False)
+        
+        if api_key:
+            self.progress_bar.setRange(0, 0)  # Marquee animation for network call
+            self.progress_bar.setFormat("Consulting Google Gemini AI Engine...")
+            self._generate_gemini_report(api_key, model_name)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("Using offline analytical templates...")
             self.generate_btn.setEnabled(True)
-            self.generate_report()
+            self.progress_bar.setVisible(False)
+            self._generate_local_report()
 
-    def generate_report(self):
+    def _generate_gemini_report(self, api_key: str, model_name: str):
+        # Extract metadata and stats
+        raw_df = self.app_state.raw_df
+        segmented_df = self.app_state.segmented_df
+        scored_df = self.app_state.scored_df
+        churn_engine = self.app_state.churn_engine
+        seg_engine = self.app_state.segmentation_engine
+
+        total_customers = len(raw_df)
+        overall_churn = raw_df["churned"].mean() if "churned" in raw_df.columns else 0.0
+        high_risk_mask = scored_df["risk_tier"] == "High"
+        high_risk_count = int(high_risk_mask.sum())
+        high_risk_pct = high_risk_count / total_customers if total_customers > 0 else 0.0
+        value_at_risk = scored_df.loc[high_risk_mask, "monetary"].sum()
+        avg_spend = raw_df["monetary"].mean()
+
+        seg_summary = seg_engine.segment_summary(segmented_df).reset_index().to_dict(orient="records")
+        top_drivers = churn_engine.feature_importances_.head(5).to_dict()
+
+        # Build detailed prompt for Gemini
+        prompt = f"""
+You are an expert Chief Marketing Officer and Data Analyst. Analyze the following customer segmentation (K-Means) and churn prediction (Random Forest) model metrics and compile a highly detailed, professional, executive-level Customer Insights HTML report.
+
+METRICS OVERVIEW:
+- Total Customers analyzed: {total_customers:,}
+- Average Customer Spend: R {avg_spend:,.2f}
+- High-Risk Customer Count: {high_risk_count:,} ({high_risk_pct:.1%})
+- Revenue currently at risk of Churn: R {value_at_risk:,.2f}
+- Overall historical churn rate: {overall_churn:.1%}
+
+CUSTOMER SEGMENTS (K-Means Clusters):
+{json.dumps(seg_summary, indent=2)}
+
+CHURN RISK PREDICTION DRIVERS (Random Forest Importances):
+{json.dumps(top_drivers, indent=2)}
+
+OUTPUT FORMAT RULES:
+- The response MUST be ONLY valid HTML content. Do NOT wrap it in ```html markdown code block format.
+- Do NOT include any intro or outro text. Return only the raw <html>...</html>.
+- Keep the styling matching our theme. Use the exact CSS styles provided below inside your <style> tag.
+- Output MUST have these 4 exact sections:
+  1. Executive Health Summary
+  2. Churn Risk Drivers (Include specific actionable playbooks for the top feature importances)
+  3. Customer Segment Analysis (Ensure a full table showing segment metrics is rendered)
+  4. Tactical Priority Plan (List at least 5 prioritized color-coded actions with badges)
+
+STYLESHEET TO INCLUDE IN THE HTML <head>:
+\"\"\"
+body {{
+    font-family: 'Segoe UI', Helvetica, Arial, sans-serif;
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    line-height: 1.65;
+    font-size: 13px;
+    margin: 0;
+    padding: 4px;
+}}
+h2 {{
+    color: #f3f4f6;
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}}
+h3 {{
+    color: #f3f4f6;
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    border-left: 3px solid #3b82f6;
+    padding-left: 10px;
+}}
+h4 {{
+    color: #e5e5e5;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 14px 0 6px 0;
+}}
+.divider {{
+    border: 0;
+    border-top: 1px solid #2c2c2c;
+    margin: 6px 0 16px 0;
+}}
+.card {{
+    background-color: #242424;
+    border: 1px solid #2c2c2c;
+    border-radius: 6px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+}}
+.kpi-grid {{
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 10px;
+    margin-top: 10px;
+}}
+.kpi-cell {{
+    background-color: #181818;
+    border: 1px solid #2c2c2c;
+    border-radius: 5px;
+    padding: 14px 10px;
+    text-align: center;
+    width: 33%;
+}}
+.kpi-label {{
+    font-size: 11px;
+    color: #a3a3a3;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+}}
+.kpi-value {{
+    font-size: 20px;
+    font-weight: 700;
+    color: #3b82f6;
+}}
+.kpi-value.risk {{
+    color: #ef4444;
+}}
+.driver-row {{
+    background-color: #181818;
+    border: 1px solid #2c2c2c;
+    border-radius: 5px;
+    padding: 12px 16px;
+    margin-bottom: 10px;
+}}
+.driver-name {{
+    font-weight: 700;
+    color: #e5e5e5;
+    font-size: 13px;
+}}
+.driver-badge {{
+    display: inline-block;
+    background-color: #1d3557;
+    color: #3b82f6;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-left: 8px;
+}}
+.driver-action {{
+    color: #b0b0b0;
+    font-size: 12px;
+    margin-top: 6px;
+    border-left: 2px solid #2c2c2c;
+    padding-left: 10px;
+}}
+.action-label {{
+    color: #3b82f6;
+    font-weight: 700;
+}}
+table.seg-table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+    font-size: 12px;
+}}
+table.seg-table th {{
+    background-color: #181818;
+    color: #e5e5e5;
+    font-weight: 600;
+    padding: 9px 10px;
+    text-align: left;
+    border-bottom: 2px solid #2c2c2c;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.4px;
+}}
+table.seg-table td {{
+    padding: 9px 10px;
+    border-bottom: 1px solid #2c2c2c;
+    color: #d4d4d4;
+}}
+table.seg-table tr:last-child td {{
+    border-bottom: none;
+}}
+table.seg-table tr:hover td {{
+    background-color: #1f1f1f;
+}}
+.playbook-item {{
+    padding: 10px 14px;
+    border-bottom: 1px solid #2c2c2c;
+}}
+.playbook-item:last-child {{
+    border-bottom: none;
+}}
+.playbook-seg {{
+    font-weight: 700;
+    color: #e5e5e5;
+    margin-bottom: 3px;
+}}
+.playbook-desc {{
+    color: #a3a3a3;
+    font-size: 12px;
+}}
+.priority-item {{
+    display: flex;
+    padding: 12px 14px;
+    border-bottom: 1px solid #2c2c2c;
+}}
+.priority-item:last-child {{
+    border-bottom: none;
+}}
+.priority-badge {{
+    font-weight: 700;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    white-space: nowrap;
+    margin-right: 14px;
+    align-self: flex-start;
+}}
+.badge-critical {{ background-color: #3b0a0a; color: #ef4444; }}
+.badge-high     {{ background-color: #3b1e0a; color: #f59e0b; }}
+.badge-medium   {{ background-color: #1a2d1a; color: #22c55e; }}
+.badge-low      {{ background-color: #1a1a2e; color: #818cf8; }}
+.priority-text  {{ color: #d4d4d4; font-size: 12.5px; line-height: 1.6; }}
+.meta           {{ color: #6b6b6b; font-size: 11px; margin-bottom: 14px; }}
+\"\"\"
+"""
+        self._worker = GeminiWorker(api_key, model_name, prompt)
+        self._worker.finished.connect(self._on_gemini_finished)
+        self._worker.start()
+
+    def _on_gemini_finished(self, result: str, success: bool):
+        self.generate_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        if success:
+            # Prepend a small meta badge indicating the report is powered by Gemini
+            gemini_meta = """
+            <div style="background-color: #101026; border: 1px solid #3b82f6; border-radius: 4px; padding: 8px 12px; margin-bottom: 14px; font-size: 11.5px; color: #93c5fd;">
+                <b>Gemini Engine Online</b>: This analysis has been fully generated by Gemini using live model metrics.
+            </div>
+            """
+            self.report_viewer.setHtml(gemini_meta + result)
+        else:
+            QMessageBox.warning(
+                self, "Gemini API Error",
+                f"Gemini API request failed. Falling back to offline analytic templates.\n\nError: {result}"
+            )
+            self._generate_local_report()
+
+    def _generate_local_report(self):
         raw_df = self.app_state.raw_df
         segmented_df = self.app_state.segmented_df
         scored_df = self.app_state.scored_df
@@ -165,12 +469,11 @@ class AiInsightsTab(QWidget):
 
         seg_summary = seg_engine.segment_summary(segmented_df).reset_index()
 
-        # Always retrieve at least 5 drivers so the report has substantive content
         all_importances = churn_engine.feature_importances_
         n_drivers = max(5, min(len(all_importances), 5))
         top_drivers = all_importances.head(n_drivers)
 
-        # ─── HTML report ─────────────────────────────────────────────────────
+        # HTML report fallback
         html = f"""
         <html>
         <head>
@@ -348,11 +651,14 @@ class AiInsightsTab(QWidget):
         </style>
         </head>
         <body>
+            <div style="background-color: #2b1a1a; border: 1px solid #ef4444; border-radius: 4px; padding: 8px 12px; margin-bottom: 14px; font-size: 11.5px; color: #fca5a5;">
+                <b>Offline Mode</b>: No Gemini API Key configured in Settings. Showing local report templates.
+            </div>
             <h2>ML Model Interpretation Report</h2>
             <p class="meta">Generated: {datetime.now().strftime("%d %B %Y at %H:%M:%S")} &nbsp;&mdash;&nbsp; Records analysed: {total_customers:,}</p>
             <hr class="divider">
 
-            <!-- ── Section 1: Executive KPI Summary ── -->
+            <!-- Executive KPI Summary -->
             <div class="card">
                 <h3>Executive Health Summary</h3>
                 <p>The analysis engine has completed a full evaluation of your customer base.
@@ -376,7 +682,7 @@ class AiInsightsTab(QWidget):
                 </table>
             </div>
 
-            <!-- ── Section 2: Churn Risk Drivers ── -->
+            <!-- Churn Risk Drivers -->
             <div class="card">
                 <h3>Churn Risk Drivers</h3>
                 <p>The Random Forest classifier identified the following behavioural and engagement features
@@ -481,7 +787,7 @@ class AiInsightsTab(QWidget):
         html += """
             </div>
 
-            <!-- ── Section 3: Segment Analysis ── -->
+            <!-- Segment Analysis -->
             <div class="card">
                 <h3>Customer Segment Analysis</h3>
                 <p>The K-Means RFM clustering model has partitioned your customer base into the segments below.
@@ -572,7 +878,7 @@ class AiInsightsTab(QWidget):
                 </div>
             </div>
 
-            <!-- ── Section 4: Tactical Priority Plan ── -->
+            <!-- Tactical Priority Plan -->
             <div class="card">
                 <h3>Tactical Priority Plan</h3>
                 <p>The following actions are ranked in order of urgency based on modelled risk exposure,
@@ -644,5 +950,4 @@ class AiInsightsTab(QWidget):
         </body>
         </html>
         """
-
         self.report_viewer.setHtml(html)
